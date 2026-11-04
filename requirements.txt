@@ -1,2 +1,6 @@
 flask
 gunicorn
+apscheduler>=3.10,<4
+requests
+beautifulsoup4
+lxml
