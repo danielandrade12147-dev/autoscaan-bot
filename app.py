@@ -1,4 +1,5 @@
 import csv
+from html import escape
 import json
 import logging
 import os
@@ -7,6 +8,7 @@ import secrets
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from io import BytesIO, StringIO
+from urllib.parse import quote_plus, urljoin
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -25,12 +27,12 @@ from flask import (
 
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "autoscaan-offline-session-key")
+app.secret_key = os.environ.get("SECRET_KEY", "scaan-auto-offline-session-key")
 
 ADMIN_USER = "admin"
 ADMIN_PASSWORD = "1234"
 AGUARDANDO = "AGUARDANDO SUA AUTORIZAÇÃO"
-DATA_DIR = os.environ.get("AUTOSCAAN_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.environ.get("SCAAN_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 EXPORT_DIR = os.path.join(DATA_DIR, "exports")
 LATEST_PRODUCTS_FILE = os.path.join(EXPORT_DIR, "produtos_atuais.json")
 ALIEXPRESS_SEARCH_URL = "https://www.aliexpress.com/w/wholesale.html"
@@ -51,7 +53,21 @@ ALIEXPRESS_CATEGORIAS = [
     "aspirador portatil",
 ]
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-logger = logging.getLogger("autoscaan")
+logger = logging.getLogger("scaan_auto")
+PRECO_SELECTORS = (
+    ".product-price-value",
+    ".product-price-current",
+    ".uniform-banner-box-price",
+    'span[class*="price"]',
+)
+IMAGEM_SELECTORS = (
+    ".magnifier-image",
+    ".images-view-item img",
+    ".image-view img",
+    'img[class*="product-image"]',
+)
+CAMBIO_USD_BRL = 5.2
+PRECO_RESERVA_BRL = 29.90
 
 PRODUCTS = [
     {
@@ -128,8 +144,14 @@ PRODUCTS = [
 
 
 def calcular_preco(product):
-    custo = product.get("custo", 0)
-    preco_custo = float(custo)
+    try:
+        preco_custo = float(product.get("custo"))
+    except (TypeError, ValueError):
+        preco_custo = PRECO_RESERVA_BRL
+        product["custo_estimado"] = True
+    if preco_custo <= 0:
+        preco_custo = PRECO_RESERVA_BRL
+        product["custo_estimado"] = True
     preco_venda = round(preco_custo * 1.5, 2)
     product["custo"] = preco_custo
     product["venda"] = preco_venda
@@ -151,10 +173,53 @@ def normalizar_url_imagem(image_url):
     return image_url
 
 
+def normalizar_imagens(image_urls):
+    if isinstance(image_urls, str):
+        values = image_urls.split("|")
+    elif isinstance(image_urls, (tuple, list, set)):
+        values = list(image_urls)
+    else:
+        values = [image_urls]
+
+    normalized = []
+    for value in values:
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("src") or value.get("imageUrl")
+        url = normalizar_url_imagem(value)
+        if url and url not in normalized:
+            normalized.append(url)
+    return "|".join(normalized)
+
+
+def imagens_do_produto(product):
+    images = normalizar_imagens(product.get("imagens") or product.get("imagem") or product.get("imagem_url"))
+    return [url for url in images.split("|") if url]
+
+
+def traduzir_titulo(title):
+    title = " ".join(str(title or "").split())
+    translations = (
+        (r"\btire\s+cover\b", "Capa de Pneu Estepe"),
+        (r"\bcar\s+light\b", "Lâmpada LED Automotiva"),
+    )
+    for pattern, replacement in translations:
+        title = re.sub(pattern, replacement, title, flags=re.IGNORECASE)
+    return title
+
+
+def peso_kg_para_titulo(title):
+    lowered = str(title or "").casefold()
+    if "pneu" in lowered or "capa" in lowered:
+        return 3.5
+    if "lampada" in lowered or "lâmpada" in lowered:
+        return 0.2
+    return 0.5
+
+
 def novo_sku(usados=None):
     usados = usados if usados is not None else set()
     for _ in range(100):
-        sku = f"AUTOSCAAN-{secrets.randbelow(9000) + 1000}"
+        sku = f"SCAAN-{secrets.randbelow(9000) + 1000}"
         if sku not in usados:
             usados.add(sku)
             return sku
@@ -166,10 +231,11 @@ for product_id, product in enumerate(PRODUCTS, start=1):
     product["fornecedor_vencedor"], product["custo"] = min(
         product["fornecedores"].items(), key=lambda item: item[1]
     )
-    product["sku"] = f"AUTOSCAAN-{product_id:03d}"
+    product["sku"] = novo_sku({item["sku"] for item in PRODUCTS[:product_id - 1]})
     product["imagem"] = product["imagem_url"]
+    product["imagens"] = product["imagem"]
     product["estoque"] = 50
-    product["peso"] = 500
+    product["peso"] = peso_kg_para_titulo(product["nome"])
     product["descricao"] = product["nome"]
     calcular_preco(product)
     product["status"] = AGUARDANDO
@@ -184,24 +250,36 @@ def _price_value(value, currency_hint=None, page_has_brl=False):
                 break
     currency_hint = str(currency_hint or "").upper()
     if isinstance(value, (int, float)):
+        if currency_hint in ("USD", "US$", "$"):
+            return round(float(value) * CAMBIO_USD_BRL, 2) if float(value) > 0 else None
         if currency_hint not in ("BRL", "R$", "REAL", "REAIS") and not page_has_brl:
             return None
         return round(float(value), 2) if float(value) > 0 else None
 
     text = str(value or "").strip()
-    explicitly_brl = "R$" in text or "BRL" in text.upper() or currency_hint in ("BRL", "R$", "REAL", "REAIS")
-    if not explicitly_brl and not page_has_brl:
+    lowered = text.casefold()
+    is_brl = "r$" in lowered or "brl" in lowered or currency_hint in ("BRL", "R$", "REAL", "REAIS")
+    is_usd = not is_brl and (
+        ("$" in text and "r$" not in lowered) or "usd" in lowered or currency_hint in ("USD", "US$")
+    )
+    if not is_brl and not is_usd and not page_has_brl:
         return None
-    match = re.search(r"([0-9][0-9.]*,[0-9]{1,2}|[0-9]+(?:\.[0-9]{1,2})?)", text)
+    match = re.search(r"([0-9][0-9.,]*[0-9]|[0-9])", text)
     if not match:
         return None
     number = match.group(1)
-    if "," in number:
+    if "," in number and "." in number and number.rfind(",") > number.rfind("."):
         number = number.replace(".", "").replace(",", ".")
+    elif "," in number and "." not in number:
+        number = number.replace(",", ".")
+    else:
+        number = number.replace(",", "")
     try:
         parsed = float(number)
     except ValueError:
         return None
+    if is_usd:
+        parsed *= CAMBIO_USD_BRL
     return round(parsed, 2) if parsed > 0 else None
 
 
@@ -215,23 +293,79 @@ def _first_value(item, keys):
 
 def _image_value(value):
     if isinstance(value, list):
-        value = value[0] if value else ""
+        return next((url for url in (_image_value(item) for item in value) if url), "")
     if isinstance(value, dict):
         value = _first_value(value, ("url", "src", "imageUrl"))
     return normalizar_url_imagem(value)
 
 
+def _images_in_element(element):
+    images = []
+    for selector in IMAGEM_SELECTORS:
+        for image_tag in element.select(selector):
+            for attribute in ("src", "data-src", "data-lazy-src", "data-original"):
+                candidate = image_tag.get(attribute)
+                if candidate:
+                    normalized = normalizar_url_imagem(candidate)
+                    if normalized and normalized not in images:
+                        images.append(normalized)
+            srcset = image_tag.get("srcset", "")
+            if srcset:
+                for candidate in srcset.split(","):
+                    normalized = normalizar_url_imagem(candidate.strip().split(" ")[0])
+                    if normalized and normalized not in images:
+                        images.append(normalized)
+    if not images:
+        for image_tag in element.select("img"):
+            candidate = next(
+                (
+                    image_tag.get(attribute)
+                    for attribute in ("src", "data-src", "data-lazy-src", "data-original")
+                    if image_tag.get(attribute)
+                ),
+                "",
+            )
+            normalized = normalizar_url_imagem(candidate)
+            if normalized and normalized not in images:
+                images.append(normalized)
+    return images
+
+
+def _price_from_element(element, page_has_brl):
+    for selector in PRECO_SELECTORS:
+        price_node = element.select_one(selector)
+        if not price_node:
+            continue
+        value = price_node.get("content") or price_node.get("data-price") or price_node.get_text(" ", strip=True)
+        price = _price_value(value, page_has_brl=page_has_brl)
+        if price:
+            return price
+    return None
+
+
 def _walk_product_data(node, page_has_brl, category):
     if isinstance(node, dict):
         title = _first_value(node, ("title", "productTitle", "name", "subject"))
-        image = _image_value(
+        images = normalizar_imagens(
             _first_value(node, ("imageUrl", "image", "productImage", "productImageUrl", "imgUrl", "imageMain"))
         )
+        if title and not images:
+            logger.warning("Produto sem foto nos dados AliExpress: %s", title)
         price = _first_value(node, ("formattedPrice", "salePrice", "price", "priceValue", "actPrice", "minPrice"))
         currency = node.get("currencyCode") or node.get("currency")
         cost = _price_value(price, currency, page_has_brl) if price is not None else None
-        if title and image and cost:
-            yield {"nome": str(title).strip(), "custo": cost, "imagem": image, "categoria": category}
+        if title and images:
+            estimated = cost is None or cost <= 0
+            cost = cost if not estimated else PRECO_RESERVA_BRL
+            yield {
+                "nome": traduzir_titulo(title),
+                "custo": cost,
+                "imagens": images,
+                "imagem": images,
+                "categoria": category,
+                "url_produto": _first_value(node, ("productDetailUrl", "productUrl", "detailUrl", "url")) or "",
+                "custo_estimado": estimated,
+            }
         for child in node.values():
             yield from _walk_product_data(child, page_has_brl, category)
     elif isinstance(node, list):
@@ -267,7 +401,7 @@ def _json_roots_from_html(soup):
 def _products_from_cards(soup, page_has_brl, category):
     results = []
     for anchor in soup.select("a[href*='/item/']"):
-        title = anchor.get("title") or anchor.get_text(" ", strip=True)
+        title = traduzir_titulo(anchor.get("title") or anchor.get_text(" ", strip=True))
         if not title or len(title) < 4:
             continue
         card = anchor
@@ -277,24 +411,32 @@ def _products_from_cards(soup, page_has_brl, category):
             card = card.parent
             if card.find("img"):
                 break
-        image_tag = card.find("img") if card else None
-        if not image_tag:
+        images = _images_in_element(card) if card else []
+        if not images:
+            logger.warning("Produto sem foto no resultado AliExpress: %s", title)
             continue
-        image = _image_value(image_tag.get("src") or image_tag.get("data-src") or image_tag.get("data-lazy-src"))
-        if not image:
-            srcset = image_tag.get("srcset", "").split(",")
-            image = _image_value(srcset[0].strip().split(" ")[0] if srcset else "")
         card_text = card.get_text(" ", strip=True)
-        currency_match = re.search(r"(?:R\$|BRL)\s*[0-9][0-9.,]*", card_text, re.I)
-        cost = _price_value(currency_match.group(0), "BRL", page_has_brl) if currency_match else None
-        if cost is None and page_has_brl:
-            for price_node in card.select('[class*="price" i], [data-testid*="price" i]'):
-                price_text = price_node.get("content") or price_node.get_text(" ", strip=True)
-                cost = _price_value(price_text, "BRL", page_has_brl)
-                if cost:
-                    break
-        if image and cost:
-            results.append({"nome": title, "custo": cost, "imagem": image, "categoria": category})
+        cost = _price_from_element(card, page_has_brl)
+        if cost is None:
+            currency_match = re.search(r"(?:R\$|BRL)\s*[0-9][0-9.,]*", card_text, re.I)
+            cost = _price_value(currency_match.group(0), "BRL", page_has_brl) if currency_match else None
+        if cost is None:
+            currency_match = re.search(r"(?:US\s*)?\$\s*[0-9][0-9.,]*", card_text, re.I)
+            cost = _price_value(currency_match.group(0), "USD") if currency_match else None
+        estimated = cost is None
+        if estimated:
+            cost = PRECO_RESERVA_BRL
+        results.append(
+            {
+                "nome": title,
+                "custo": cost,
+                "imagens": images,
+                "imagem": images,
+                "categoria": category,
+                "url_produto": urljoin(ALIEXPRESS_SEARCH_URL, anchor.get("href", "")),
+                "custo_estimado": estimated,
+            }
+        )
     return results
 
 
@@ -318,6 +460,8 @@ def _buscar_categoria_aliexpress(category):
     for root in _json_roots_from_html(soup):
         products.extend(_walk_product_data(root, page_has_brl, category))
     products.extend(_products_from_cards(soup, page_has_brl, category))
+    if not products:
+        logger.warning("Busca AliExpress sem produtos com foto para a categoria '%s'.", category)
     return products
 
 
@@ -340,19 +484,29 @@ def buscar_produtos(qtd=100):
             por_categoria[category] = []
             vistos_categoria = set()
             for product in category_products:
-                image = normalizar_url_imagem(product.get("imagem"))
-                title = " ".join(product.get("nome", "").split())
+                image_list = normalizar_imagens(product.get("imagens") or product.get("imagem"))
+                image = image_list.split("|", 1)[0] if image_list else ""
+                title = traduzir_titulo(" ".join(product.get("nome", "").split()))
                 try:
                     cost = float(product.get("custo"))
                 except (TypeError, ValueError):
                     continue
                 key = (title.casefold(), image)
-                if not title or not image or cost <= 0 or key in vistos_categoria:
+                if not title or not image_list or cost <= 0 or key in vistos_categoria:
                     continue
                 vistos_categoria.add(key)
-                product.update({"nome": title, "custo": cost, "imagem": image, "imagem_url": image})
+                product.update(
+                    {
+                        "nome": title,
+                        "custo": cost,
+                        "imagens": image_list,
+                        "imagem": image,
+                        "imagem_url": image,
+                        "peso": peso_kg_para_titulo(title),
+                        "categoria": "Automotivo",
+                    }
+                )
                 product["estoque"] = 50
-                product["peso"] = 500
                 product["descricao"] = title
                 product["origem"] = "AliExpress"
                 calcular_preco(product)
@@ -387,12 +541,13 @@ def buscar_produtos(qtd=100):
         product = dict(original)
         product["fornecedores"] = dict(original.get("fornecedores", {}))
         product["imagem"] = normalizar_url_imagem(original.get("imagem_url"))
+        product["imagens"] = product["imagem"]
         product["imagem_url"] = product["imagem"]
         product["sku"] = novo_sku(skus)
         product["estoque"] = 50
-        product["peso"] = 500
+        product["peso"] = peso_kg_para_titulo(product["nome"])
         product["descricao"] = product["nome"]
-        product["categoria"] = product.get("categoria", "Acessórios automotivos")
+        product["categoria"] = "Automotivo"
         product["origem"] = "Catálogo local existente"
         calcular_preco(product)
         fallback.append(product)
@@ -412,7 +567,7 @@ LOGIN_HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Login | AUTOSCAAN AUTO</title>
+  <title>Login | SCAAN AUTO PEÇAS</title>
   <style>
     * { box-sizing: border-box; }
     body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 24px;
@@ -433,7 +588,7 @@ LOGIN_HTML = """
 </head>
 <body>
   <main class="card">
-    <div class="eyebrow">AUTOSCAAN AUTO</div>
+    <div class="eyebrow">SCAAN AUTO PEÇAS</div>
     <h1>Acesso do administrador</h1>
     <form method="post">
       <label for="usuario">Usuário</label>
@@ -454,7 +609,7 @@ ADMIN_HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AUTOSCAAN AUTO - Catálogo</title>
+  <title>SCAAN AUTO PEÇAS - Bot Garimpo Nova Iguaçu - Nuvemshop + Shopee</title>
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; color: #e5e7eb; background: #07110f; font: 14px Arial, sans-serif; }
@@ -498,7 +653,7 @@ ADMIN_HTML = """
     .supplier { display: block; margin: 0 0 5px; color: #aebcb6; white-space: nowrap; }
     .winner { color: #4ade80; font-weight: bold; }
     .profit { color: #86efac; font-weight: bold; }
-    .product-photo { display: block; width: 68px; height: 68px; object-fit: contain;
+    .product-photo { display: block; width: 50px; height: 50px; object-fit: contain;
       border: 1px solid #315347; border-radius: 9px; background: #fff; }
     .select-count { color: #a7f3d0; font-weight: bold; }
     .status { display: inline-block; max-width: 220px; padding: 7px 9px; border: 1px solid #6b5428;
@@ -509,11 +664,11 @@ ADMIN_HTML = """
 </head>
 <body>
 <header><div class="wrap top">
-  <div><div class="brand">AUTOSCAAN AUTO</div><h1>Catálogo automotivo</h1></div>
+  <div><div class="brand">Scaan Auto Peças</div><h1>SCAAN AUTO PEÇAS - Bot Garimpo Nova Iguaçu - Nuvemshop + Shopee</h1></div>
   <a class="logout" href="{{ url_for('logout') }}">Sair</a>
 </div></header>
 <main class="wrap">
-  <div class="notice">Origem do catálogo: {{ origem_garimpo }}. O garimpo percorre {{ categorias_buscadas }} categorias; a quantidade final depende dos resultados disponíveis em reais e com imagem.</div>
+  <div class="notice">Origem do catálogo: {{ origem_garimpo }}. Preços não lidos do AliExpress usam o valor de reserva R$ 29,90; confirme custo e frete antes de publicar.</div>
   {% with messages = get_flashed_messages() %}{% for message in messages %}<div class="flash">{{ message }}</div>{% endfor %}{% endwith %}
   <section class="summary">
     <div class="metric"><span>Produtos em análise</span><strong>{{ produtos|length }}</strong></div>
@@ -523,33 +678,44 @@ ADMIN_HTML = """
   <div class="toolbar">
     <form method="post" action="{{ url_for('rodar_agora') }}"><button class="action" type="submit">Rodar Garimpo de Hoje Agora</button></form>
     <button class="secondary" id="top10" type="button">Selecionar Top 10 Maior Lucro</button>
-    <span class="select-count"><span id="selected-count">0</span> selecionados</span>
-    <a class="secondary" href="{{ url_for('download') }}">Baixar CSV completo</a>
+    <span class="select-count"><span id="selected-count">0</span> produtos prontos pra vender hoje</span>
   </div>
   <section class="history">
     <h2>HISTORICO DIARIO</h2>
     {% if arquivos_csv %}<ul>{% for arquivo in arquivos_csv %}<li>{{ arquivo.data }} — <a href="{{ url_for('baixar_csv_arquivo', filename=arquivo.nome) }}">{{ arquivo.nome }}</a></li>{% endfor %}</ul>
     {% else %}<p class="history-empty">Nenhum CSV foi gerado ainda.</p>{% endif %}
   </section>
-  <form method="post" action="{{ url_for('gerar_csv_selecionados') }}" id="form-selecionados">
+  <form method="post" action="{{ url_for('exportar_plataforma', plataforma='nuvemshop') }}" id="form-selecionados">
   <div class="table-box"><table>
-    <thead><tr><th>Selecionar</th><th>Foto</th><th>Nome</th><th>Custo</th><th>Venda (50%)</th><th>Categoria</th></tr></thead>
+    <thead><tr><th>Selecionar</th><th>Foto</th><th>Nome Scaan</th><th>Custo R$</th><th>Venda R$</th><th>Peso kg</th><th>SKU SCAAN-</th><th>Link Ali</th></tr></thead>
     <tbody>
     {% for produto in produtos %}
       <tr data-profit="{{ produto.lucro }}">
         <td><input type="checkbox" class="product-check" name="skus" value="{{ produto.sku }}" aria-label="Selecionar {{ produto.nome }}"></td>
-        <td><img class="product-photo" src="{{ produto.imagem }}" alt="{{ produto.nome }}" loading="lazy"></td>
-        <td><strong>{{ produto.nome }}</strong></td>
-        <td>{{ produto.custo|brl }}</td>
+        <td>{% if produto.imagem %}<img class="product-photo" src="{{ produto.imagem }}" alt="{{ produto.nome }}" loading="lazy">{% endif %}</td>
+        <td><strong>{{ produto.titulo_venda }}</strong></td>
+        <td>{{ produto.custo|brl }}{% if produto.custo_estimado %}<br><small>Estimado</small>{% endif %}</td>
         <td class="profit">{{ produto.venda|brl }}</td>
-        <td>{{ produto.categoria }}</td>
+        <td>{{ "%.2f"|format(produto.peso) }}</td>
+        <td>{{ produto.sku }}</td>
+        <td><a href="{{ produto.link_aliexpress }}" target="_blank" rel="noopener">Abrir AliExpress</a></td>
       </tr>
     {% endfor %}
     </tbody>
   </table></div>
-  <div class="toolbar"><button class="action" type="submit">GERAR CSV COM SELECIONADOS</button></div>
+  <div class="toolbar">
+    <button class="action" type="submit">BAIXAR CSV NUVEMSHOP - SCAAN</button>
+    <button class="action" type="submit" formaction="{{ url_for('exportar_plataforma', plataforma='shopee') }}">BAIXAR CSV SHOPEE - SCAAN</button>
+  </div>
   </form>
-  <p class="foot">Preço de venda = custo × 1,5. O CSV usa UTF-8 com BOM e separador ponto e vírgula.</p>
+  <section class="history">
+    <h2>CHECKLIST GRÁTIS LOJA CONFIÁVEL</h2>
+    <label><input type="checkbox"> 1. Nuvemshop &gt; Configurações &gt; Endereço Nova Iguaçu</label><br><br>
+    <label><input type="checkbox"> 2. Layout &gt; Rodapé &gt; WhatsApp oficial</label><br><br>
+    <label><input type="checkbox"> 3. Config &gt; Frete &gt; Frete Grátis Nova Iguaçu acima de R$ 50 (se configurado)</label><br><br>
+    <label><input type="checkbox"> 4. Produtos &gt; Avaliações &gt; Publique somente avaliações reais</label>
+  </section>
+  <p class="foot">Preço de venda = custo × 1,5. Nuvemshop: ponto e vírgula; Shopee: vírgula. Fotos separadas por |. Confirme preços, frete, estoque e informações da loja antes de publicar.</p>
 </main>
 <script>
   const checkboxes = Array.from(document.querySelectorAll('.product-check'));
@@ -573,18 +739,65 @@ def require_login():
     return bool(session.get("logged_in"))
 
 
+def _descricao_html(product):
+    title = escape(product["titulo_venda"])
+    product_name = escape(product["nome"])
+    sku = escape(product["sku"])
+    weight = f'{product["peso"]:.2f}'
+    return (
+        f"<h2>{title}</h2>"
+        "<p>📍 <b>SCAAN AUTO PEÇAS - NOVA IGUAÇU - RJ</b> | Atendimento pelo chat da plataforma</p>"
+        "<p>🚚 Consulte o custo e o prazo de entrega informando seu CEP no checkout.</p>"
+        "<hr><h3>Informações do produto</h3>"
+        f"<p><b>PRODUTO:</b> {product_name}. Confira compatibilidade, medidas e aplicação antes da compra.</p>"
+        f"<p><b>CONTEÚDO:</b> 1x {product_name} | PESO: {weight} kg | SKU: {sku}</p>"
+        "<p>Garantia, nota fiscal e rastreamento seguem as condições informadas pela loja e pela plataforma.</p>"
+    )
+
+
+def _descricao_texto(product):
+    return (
+        f'🛠️ {product["titulo_venda"]}\n'
+        "📍 SCAAN AUTO PEÇAS - NOVA IGUAÇU - RJ\n"
+        "💬 Atendimento pelo chat da plataforma\n"
+        "🚚 Consulte custo e prazo pelo CEP no checkout\n\n"
+        "✅ Confira compatibilidade, medidas e aplicação antes da compra.\n"
+        f'📦 CONTEÚDO: 1x {product["nome"]}\n'
+        f'⚖️ PESO: {product["peso"]:.2f} kg\n'
+        f'🏷️ SKU: {product["sku"]}\n'
+        "ℹ️ Garantia, nota fiscal e rastreamento conforme as condições da loja e da plataforma."
+    )
+
+
 def _normalizar_produto(product):
     item = dict(product)
-    item["imagem"] = normalizar_url_imagem(item.get("imagem") or item.get("imagem_url"))
+    item["nome"] = traduzir_titulo(item.get("nome") or "Produto automotivo")
+    item["imagens"] = normalizar_imagens(item.get("imagens") or item.get("imagem") or item.get("imagem_url"))
+    image_list = imagens_do_produto(item)
+    if not image_list:
+        logger.warning("Produto sem URL de imagem: %s", item["nome"])
+    item["imagem"] = image_list[0] if image_list else ""
     item["imagem_url"] = item["imagem"]
-    item.setdefault("categoria", "Acessórios automotivos")
-    if not item.get("sku"):
+    item["categoria"] = "Automotivo"
+    if not re.fullmatch(r"SCAAN-\d{4}", str(item.get("sku", ""))):
         item["sku"] = novo_sku()
+    item["peso"] = peso_kg_para_titulo(item["nome"])
     item.setdefault("estoque", 50)
-    item.setdefault("peso", 500)
-    item.setdefault("descricao", item.get("nome", "Produto automotivo"))
-    item.setdefault("custo", 0)
+    try:
+        item["custo"] = float(item.get("custo"))
+    except (TypeError, ValueError):
+        item["custo"] = PRECO_RESERVA_BRL
+        item["custo_estimado"] = True
     calcular_preco(item)
+    item["lucro"] = round(item["venda"] - item["custo"], 2)
+    item["titulo_venda"] = f'{item["nome"]} Premium - Scaan Auto Peças Nova Iguaçu'
+    product_url = str(item.get("url_produto") or "").strip()
+    product_url = urljoin(ALIEXPRESS_SEARCH_URL, product_url) if product_url else ""
+    if product_url.startswith("http://"):
+        product_url = "https://" + product_url[len("http://"):]
+    if not product_url.startswith("https://"):
+        product_url = f"{ALIEXPRESS_SEARCH_URL}?SearchText={quote_plus(item['nome'])}"
+    item["link_aliexpress"] = product_url
     return item
 
 
@@ -620,26 +833,68 @@ def _carregar_produtos_atuais():
     return products, "Catálogo local de reserva"
 
 
-def _csv_text(produtos):
+def gerar_csv_completo(produtos, plataforma):
+    plataforma = str(plataforma).strip().lower()
+    if plataforma == "nuvemshop":
+        delimiter = ";"
+        headers = [
+            "Nome",
+            "Preço",
+            "SKU",
+            "Estoque",
+            "Peso (kg)",
+            "Altura (cm)",
+            "Largura (cm)",
+            "Profundidade (cm)",
+            "Imagens",
+            "Descrição",
+            "Categoria",
+            "Marca",
+        ]
+    elif plataforma == "shopee":
+        delimiter = ","
+        headers = ["Nome", "Preço", "Estoque", "SKU", "Peso(g)", "Descrição", "Imagens", "Categoria"]
+    else:
+        raise ValueError("Plataforma inválida. Use 'nuvemshop' ou 'shopee'.")
+
     output = StringIO(newline="")
-    writer = csv.writer(output, delimiter=";", lineterminator="\r\n")
-    writer.writerow(["Nome", "Preço", "SKU", "Estoque", "Peso", "Imagens", "Descrição", "Categoria"])
+    writer = csv.writer(output, delimiter=delimiter, lineterminator="\r\n")
+    writer.writerow(headers)
     for original in produtos:
         product = _normalizar_produto(original)
-        preco_venda = product["venda"]
-        imagem = normalizar_url_imagem(product.get("imagem"))
-        writer.writerow(
-            [
-                product["nome"],
-                f"{preco_venda:.2f}",
-                product["sku"],
-                50,
-                500,
-                imagem,
-                product["descricao"],
-                product["categoria"],
-            ]
-        )
+        nome = product["titulo_venda"]
+        preco = f'{round(float(product["custo"]) * 1.5, 2):.2f}'
+        images = normalizar_imagens(product.get("imagens"))
+        if plataforma == "nuvemshop":
+            writer.writerow(
+                [
+                    nome,
+                    preco,
+                    product["sku"],
+                    100,
+                    f'{product["peso"]:.2f}',
+                    30,
+                    30,
+                    15,
+                    images,
+                    _descricao_html(product),
+                    "Automotivo",
+                    "Scaan Auto Peças",
+                ]
+            )
+        else:
+            writer.writerow(
+                [
+                    nome,
+                    preco,
+                    100,
+                    product["sku"],
+                    round(product["peso"] * 1000),
+                    _descricao_texto(product),
+                    images,
+                    "Automotivo",
+                ]
+            )
     return output.getvalue()
 
 
@@ -651,7 +906,7 @@ def salvar_csv(filename, produtos=None, atualizar_catalogo=True):
     if produtos is None:
         produtos, _ = _carregar_produtos_atuais()
     normalized = [_normalizar_produto(product) for product in produtos]
-    content = _csv_text(normalized)
+    content = gerar_csv_completo(normalized, "nuvemshop")
     path = os.path.join(EXPORT_DIR, safe_filename)
     with open(path, "w", encoding="utf-8-sig", newline="") as csv_file:
         csv_file.write(content)
@@ -664,8 +919,10 @@ def job_diario():
     produtos = buscar_produtos(100)
     for product in produtos:
         calcular_preco(product)
-    filename = f"autoscaan_{date.today()}.csv"
-    return salvar_csv(filename, produtos)
+    day = date.today()
+    nuvemshop_path = salvar_csv(f"scaan_nuvemshop_{day}.csv", produtos)
+    salvar_csv(f"scaan_shopee_{day}.csv", produtos, atualizar_catalogo=False)
+    return nuvemshop_path
 
 
 def _historico_csv():
@@ -673,7 +930,7 @@ def _historico_csv():
         return []
     entries = []
     for filename in os.listdir(EXPORT_DIR):
-        if not filename.startswith("autoscaan_") or not filename.lower().endswith(".csv"):
+        if not filename.startswith("scaan_") or not filename.lower().endswith(".csv"):
             continue
         match = re.search(r"(\d{4}-\d{2}-\d{2})", filename)
         entries.append(
@@ -730,19 +987,30 @@ def rodar_agora():
     return redirect(url_for("admin"))
 
 
+@app.route("/exportar/<plataforma>", methods=["POST"])
 @app.route("/gerar-csv-selecionados", methods=["POST"])
-def gerar_csv_selecionados():
+def exportar_plataforma(plataforma="nuvemshop"):
     if not require_login():
         return redirect(url_for("admin"))
+    if plataforma not in ("nuvemshop", "shopee"):
+        return "Plataforma inválida.", 404
     selected_skus = set(request.form.getlist("skus"))
     products, _ = _carregar_produtos_atuais()
     selected = [product for product in products if product.get("sku") in selected_skus]
     if not selected:
         flash("Marque pelo menos um produto para gerar o CSV.")
         return redirect(url_for("admin"))
-    filename = f"autoscaan_selecionados_{date.today()}_{datetime.now().strftime('%H%M%S')}.csv"
-    salvar_csv(filename, selected, atualizar_catalogo=False)
-    return send_from_directory(EXPORT_DIR, filename, as_attachment=True, mimetype="text/csv; charset=utf-8")
+    filename = f"scaan_{plataforma}_selecionados_{date.today()}_{datetime.now().strftime('%H%M%S')}.csv"
+    csv_bytes = gerar_csv_completo(selected, plataforma).encode("utf-8-sig")
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    with open(os.path.join(EXPORT_DIR, filename), "wb") as csv_file:
+        csv_file.write(csv_bytes)
+    return send_file(
+        BytesIO(csv_bytes),
+        as_attachment=True,
+        download_name=filename,
+        mimetype="text/csv; charset=utf-8-sig",
+    )
 
 
 @app.route("/csvs/<path:filename>")
@@ -759,10 +1027,11 @@ def download():
         return redirect(url_for("admin"))
 
     products, _ = _carregar_produtos_atuais()
+    csv_bytes = gerar_csv_completo(products, "nuvemshop").encode("utf-8-sig")
     return send_file(
-        BytesIO(_csv_text(products).encode("utf-8-sig")),
+        BytesIO(csv_bytes),
         as_attachment=True,
-        download_name="AUTOSCAAN_AUTO_DROP.csv",
+        download_name="SCAAN_AUTO_PECAS_NUVEMSHOP.csv",
         mimetype="text/csv; charset=utf-8-sig",
     )
 
