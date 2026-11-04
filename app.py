@@ -1,7 +1,7 @@
+import csv
 import os
-from io import BytesIO
+from io import BytesIO, StringIO
 
-import pandas as pd
 from flask import Flask, redirect, render_template_string, request, send_file, session, url_for
 
 
@@ -15,50 +15,72 @@ AGUARDANDO = "AGUARDANDO SUA AUTORIZAÇÃO"
 PRODUCTS = [
     {
         "nome": "Capa volante couro",
+        "categoria": "Acessórios automotivos",
+        "peso": 450,
         "fornecedores": {"AliExpress Choice": 28.90, "CJ Dropshipping BR": 31.90, "Shopee Nacional": 35.00},
     },
     {
         "nome": "Organizador banco",
+        "categoria": "Acessórios automotivos",
+        "peso": 700,
         "fornecedores": {"AliExpress Choice": 22.50, "CJ Dropshipping BR": 25.00, "Shopee Nacional": 27.90},
     },
     {
         "nome": "Aspirador portátil",
+        "categoria": "Acessórios automotivos",
+        "peso": 1200,
         "fornecedores": {"AliExpress Choice": 48.00, "CJ Dropshipping BR": 54.90, "Shopee Nacional": 59.90},
     },
     {
         "nome": "Suporte celular",
+        "categoria": "Acessórios automotivos",
+        "peso": 250,
         "fornecedores": {"AliExpress Choice": 15.90, "CJ Dropshipping BR": 18.50, "Shopee Nacional": 21.00},
     },
     {
         "nome": "Película farol",
+        "categoria": "Acessórios automotivos",
+        "peso": 200,
         "fornecedores": {"AliExpress Choice": 17.50, "CJ Dropshipping BR": 19.90, "Shopee Nacional": 23.50},
     },
     {
         "nome": "Aromatizador",
+        "categoria": "Aromatizadores",
+        "peso": 180,
         "fornecedores": {"AliExpress Choice": 12.90, "CJ Dropshipping BR": 15.00, "Shopee Nacional": 16.90},
     },
     {
         "nome": "Capa cinto",
+        "categoria": "Acessórios automotivos",
+        "peso": 100,
         "fornecedores": {"AliExpress Choice": 9.90, "CJ Dropshipping BR": 12.50, "Shopee Nacional": 14.00},
     },
     {
         "nome": "Tapete porta-malas",
+        "categoria": "Tapetes automotivos",
+        "peso": 1500,
         "fornecedores": {"AliExpress Choice": 38.00, "CJ Dropshipping BR": 43.00, "Shopee Nacional": 49.90},
     },
     {
         "nome": "Limpador vidro",
+        "categoria": "Limpeza automotiva",
+        "peso": 350,
         "fornecedores": {"AliExpress Choice": 13.50, "CJ Dropshipping BR": 16.00, "Shopee Nacional": 17.90},
     },
     {
         "nome": "Luz led interna",
+        "categoria": "Iluminação automotiva",
+        "peso": 220,
         "fornecedores": {"AliExpress Choice": 19.90, "CJ Dropshipping BR": 22.00, "Shopee Nacional": 25.00},
     },
 ]
 
-for product in PRODUCTS:
+for product_id, product in enumerate(PRODUCTS, start=1):
+    product["id"] = product_id
     product["fornecedor_vencedor"], product["custo"] = min(
         product["fornecedores"].items(), key=lambda item: item[1]
     )
+    product["sku"] = f"AUTOSCAAN-{product_id:03d}"
     product["preco"] = round(product["custo"] * 1.5, 2)
     product["lucro"] = round(product["preco"] - product["custo"], 2)
     product["status"] = AGUARDANDO
@@ -166,7 +188,7 @@ ADMIN_HTML = """
     <div class="metric"><span>Lucro médio sobre o custo</span><strong>{{ lucro_medio|brl }}</strong></div>
     <div class="metric"><span>Fornecedores comparados</span><strong>{{ produtos|length * 3 }}</strong></div>
   </section>
-  <a class="download" href="{{ url_for('download') }}">📥 Baixar AUTOSCAAN_AUTO_DROP.xlsx</a>
+  <a class="download" href="{{ url_for('export_csv') }}">📥 Baixar CSV Nuvemshop (.csv)</a>
   <div class="table-box"><table>
     <thead><tr><th>Produto</th><th>3 fornecedores / custo</th><th>Menor custo</th><th>Preço de venda</th><th>Lucro</th><th>Status</th></tr></thead>
     <tbody>
@@ -219,42 +241,36 @@ def admin():
     )
 
 
-@app.route("/download")
-def download():
+@app.route("/export-csv")
+def export_csv():
     if not require_login():
         return redirect(url_for("admin"))
 
-    rows = [
-        {
-            "Nome": product["nome"],
-            "Preço": product["preco"],
-            "Estoque (50)": 50,
-            "Descrição": (
-                f"{product['nome']} automotivo. Menor custo estimado: "
-                f"{format_brl(product['custo'])}; preço sugerido com acréscimo de 50%: "
-                f"{format_brl(product['preco'])}."
-            ),
-        }
-        for product in PRODUCTS
-    ]
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(rows, columns=["Nome", "Preço", "Estoque (50)", "Descrição"]).to_excel(
-            writer, index=False, sheet_name="Produtos"
+    output = StringIO(newline="")
+    writer = csv.writer(output, delimiter=";", lineterminator="\r\n")
+    writer.writerow(["Nome", "Preco", "SKU", "Categorias", "Estoque", "Peso", "Descricao"])
+    for product in PRODUCTS:
+        description = (
+            f"{product['nome']} automotivo. Menor custo estimado: "
+            f"{product['custo']:.2f}. Preço sugerido com acréscimo de 50% sobre o custo."
         )
-        worksheet = writer.sheets["Produtos"]
-        worksheet.freeze_panes = "A2"
-        worksheet.auto_filter.ref = worksheet.dimensions
-        worksheet.column_dimensions["A"].width = 34
-        worksheet.column_dimensions["B"].width = 16
-        worksheet.column_dimensions["C"].width = 16
-        worksheet.column_dimensions["D"].width = 72
+        writer.writerow(
+            [
+                product["nome"],
+                f"{product['preco']:.2f}",
+                product["sku"],
+                product["categoria"],
+                50,
+                product["peso"],
+                description,
+            ]
+        )
     output.seek(0)
     return send_file(
-        output,
+        BytesIO(output.getvalue().encode("utf-8")),
         as_attachment=True,
-        download_name="AUTOSCAAN_AUTO_DROP.xlsx",
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        download_name="AUTOSCAAN_AUTO_DROP.csv",
+        mimetype="text/csv; charset=utf-8",
     )
 
 
