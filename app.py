@@ -188,7 +188,7 @@ ADMIN_HTML = """
     <div class="metric"><span>Lucro médio sobre o custo</span><strong>{{ lucro_medio|brl }}</strong></div>
     <div class="metric"><span>Fornecedores comparados</span><strong>{{ produtos|length * 3 }}</strong></div>
   </section>
-  <a class="download" href="{{ url_for('export_csv') }}">📥 Baixar CSV Nuvemshop (.csv)</a>
+  <a class="download" href="{{ url_for('download') }}">📥 Baixar CSV Nuvemshop (.csv)</a>
   <div class="table-box"><table>
     <thead><tr><th>Produto</th><th>3 fornecedores / custo</th><th>Menor custo</th><th>Preço de venda</th><th>Lucro</th><th>Status</th></tr></thead>
     <tbody>
@@ -241,8 +241,9 @@ def admin():
     )
 
 
+@app.route("/download")
 @app.route("/export-csv")
-def export_csv():
+def download():
     if not require_login():
         return redirect(url_for("admin"))
 
