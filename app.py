@@ -17,60 +17,70 @@ PRODUCTS = [
         "nome": "Capa volante couro",
         "categoria": "Acessórios automotivos",
         "peso": 450,
+        "imagem_url": "https://ae01.alicdn.com/kf/Sc5477bafe3cf4784b336506192cd4adbe.jpg",
         "fornecedores": {"AliExpress Choice": 28.90, "CJ Dropshipping BR": 31.90, "Shopee Nacional": 35.00},
     },
     {
         "nome": "Organizador banco",
         "categoria": "Acessórios automotivos",
         "peso": 700,
+        "imagem_url": "https://ae01.alicdn.com/kf/Sc1c337498d464700b69c839eab018df3O.jpg",
         "fornecedores": {"AliExpress Choice": 22.50, "CJ Dropshipping BR": 25.00, "Shopee Nacional": 27.90},
     },
     {
         "nome": "Aspirador portátil",
         "categoria": "Acessórios automotivos",
         "peso": 1200,
+        "imagem_url": "https://ae01.alicdn.com/kf/Sa5fc9e63faa743b49857e6cd1caf36dfC.jpg",
         "fornecedores": {"AliExpress Choice": 48.00, "CJ Dropshipping BR": 54.90, "Shopee Nacional": 59.90},
     },
     {
         "nome": "Suporte celular",
         "categoria": "Acessórios automotivos",
         "peso": 250,
+        "imagem_url": "https://ae01.alicdn.com/kf/HTB1EfOwac_vK1Rjy0Foq6xIxVXao.jpg",
         "fornecedores": {"AliExpress Choice": 15.90, "CJ Dropshipping BR": 18.50, "Shopee Nacional": 21.00},
     },
     {
         "nome": "Película farol",
         "categoria": "Acessórios automotivos",
         "peso": 200,
+        "imagem_url": "https://ae01.alicdn.com/kf/S32d8f62d603e406eb169c69e421a758fR/Gloss-Transparent-Light-Black-Smoke-PVC-Film-Tint-30-X60cm-Auto-Car-Light-Headlight-Taillight-Tint.jpg",
         "fornecedores": {"AliExpress Choice": 17.50, "CJ Dropshipping BR": 19.90, "Shopee Nacional": 23.50},
     },
     {
         "nome": "Aromatizador",
         "categoria": "Aromatizadores",
         "peso": 180,
+        "imagem_url": "https://ae01.alicdn.com/kf/S3e9908a40e6a4630b997bb5f43829245y.jpg",
         "fornecedores": {"AliExpress Choice": 12.90, "CJ Dropshipping BR": 15.00, "Shopee Nacional": 16.90},
     },
     {
         "nome": "Capa cinto",
         "categoria": "Acessórios automotivos",
         "peso": 100,
+        "imagem_url": "https://ae01.alicdn.com/kf/S441f589525854abd9317a6981c7ee846V/Car-Accessories-Seat-Belt-For-Suzuki-Kizashi-Swift-Vitara-SX4-Pu-Leather-Safety-Belt-Shoulder-Cover.jpg",
         "fornecedores": {"AliExpress Choice": 9.90, "CJ Dropshipping BR": 12.50, "Shopee Nacional": 14.00},
     },
     {
         "nome": "Tapete porta-malas",
         "categoria": "Tapetes automotivos",
         "peso": 1500,
+        "imagem_url": "https://ae01.alicdn.com/kf/Sc78a8241c48748ba9ddd40e21525a294Z.jpg",
         "fornecedores": {"AliExpress Choice": 38.00, "CJ Dropshipping BR": 43.00, "Shopee Nacional": 49.90},
     },
     {
         "nome": "Limpador vidro",
         "categoria": "Limpeza automotiva",
         "peso": 350,
+        "imagem_url": "https://ae01.alicdn.com/kf/Se0d06305fafa4e3c88e312f61351f9bbS.jpg",
         "fornecedores": {"AliExpress Choice": 13.50, "CJ Dropshipping BR": 16.00, "Shopee Nacional": 17.90},
     },
     {
         "nome": "Luz led interna",
         "categoria": "Iluminação automotiva",
         "peso": 220,
+        "imagem_url": "https://ae01.alicdn.com/kf/S85829c26ec7b4a9ca8a7400bf7867870G.jpg",
         "fornecedores": {"AliExpress Choice": 19.90, "CJ Dropshipping BR": 22.00, "Shopee Nacional": 25.00},
     },
 ]
@@ -249,7 +259,7 @@ def download():
 
     output = StringIO(newline="")
     writer = csv.writer(output, delimiter=";", lineterminator="\r\n")
-    writer.writerow(["Nome", "Preco", "SKU", "Categorias", "Estoque", "Peso", "Descricao"])
+    writer.writerow(["Nome", "Preco", "SKU", "Categorias", "Estoque", "Peso", "Descricao", "Imagens"])
     for product in PRODUCTS:
         description = (
             f"{product['nome']} automotivo. Menor custo estimado: "
@@ -264,6 +274,7 @@ def download():
                 50,
                 product["peso"],
                 description,
+                product["imagem_url"],
             ]
         )
     output.seek(0)
